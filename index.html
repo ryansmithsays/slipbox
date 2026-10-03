@@ -74,6 +74,7 @@ function setReason(a,b,t){
 
 // ---------- local matching (free, runs in the browser) ----------
 // Rare shared words count more than common ones; title matches and shared tags count extra.
+// The four topic tags are skipped here so link suggestions can cross topics.
 function idfMap(){
   var df={},N=db.notes.length||1,idf={};
   db.notes.forEach(function(n){noteWords(n).forEach(function(w){df[w]=(df[w]||0)+1})});
@@ -83,7 +84,7 @@ function idfMap(){
 function scoreNote(qw,qtags,o,idf){
   var s=0,why=[],w=noteWords(o),tw=words(o.title);
   qw.forEach(function(x){if(w.has(x)){var v=idf[x]||1;s+=v;if(tw.has(x))s+=v*0.5;why.push(x)}});
-  o.tags.forEach(function(t){if(qtags.indexOf(t)>-1||qw.has(t)){s+=3;why.unshift(t)}});
+  o.tags.forEach(function(t){if(TOPICS.indexOf(t)>-1)return;if(qtags.indexOf(t)>-1||qw.has(t)){s+=3;why.unshift(t)}});
   return {score:s,why:why};
 }
 function suggest(note,limit){
@@ -103,7 +104,8 @@ function unlink(a,b){
 }
 
 // ---------- Claude calls ----------
-var SORT_SYS='You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags, type. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: 1 to 4 lowercase single words. type: "source" if the note records what a source said or argued, or "idea" if it is the writer\'s own thought, reaction, or application; use "idea" when unclear. One idea per note. Never invent facts that are not in the text.';
+var TOPICS=['storytelling','philosophy','politics','facts'];
+var SORT_SYS='You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags, type. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: an array of 1 to 4 lowercase single words. The first tag must be the closest topic from this list: storytelling, philosophy, politics, facts. Use facts for standalone facts that fit none of the others. Any remaining tags are free-form. type: "source" if the note records what a source said or argued, or "idea" if it is the writer\'s own thought, reaction, or application; use "idea" when unclear. One idea per note. Never invent facts that are not in the text.';
 function trackUsage(model,u){
   if(!u)return;
   var mo=new Date().toISOString().slice(0,7),s=db.settings.usage;
@@ -146,7 +148,7 @@ async function aiSort(raw,source){
   for(const c of chunks){
     var txt=await callClaude({system:SORT_SYS,user:(source?'Source: '+source+'\n\n':'')+c,max:1000});
     var arr=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    arr.slice(0,3).forEach(function(d){drafts.push({id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(d.tags||[]).map(function(t){return String(t).toLowerCase()}).slice(0,4),type:d.type==='source'?'source':'idea'})});
+    arr.slice(0,3).forEach(function(d){drafts.push({id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(function(t){t=(t||[]).map(function(x){return String(x).toLowerCase()});var i=t.findIndex(function(x){return TOPICS.indexOf(x)>-1});if(i>0)t.unshift(t.splice(i,1)[0]);return t.slice(0,4)})(d.tags),type:d.type==='source'?'source':'idea'})});
   }
   if(cut)toast('Long dump: AI sorted the first part only. The full text is in the original.');
   return drafts.slice(0,12);
