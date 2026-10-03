@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6f5c">
+<title>Slipbox</title>
+<style>
+:root{--bg:#faf8f4;--card:#fff;--ink:#222;--mute:#6b6b6b;--line:#e4e0d8;--accent:#1f6f5c;--accent-ink:#fff;--warn:#b3402a;box-sizing:border-box}
+@media (prefers-color-scheme:dark){:root{--bg:#161715;--card:#202220;--ink:#ecebe6;--mute:#9a9a94;--line:#33362f;--accent:#4fb89c;--accent-ink:#0d1a16;--warn:#e07a63}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding-top:env(safe-area-inset-top,0)}
+main{max-width:640px;margin:0 auto;padding:16px 16px 100px}
+h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:0 0 6px}
+p.hint{color:var(--mute);margin:0 0 12px;font-size:14px}
+textarea,input,select{width:100%;font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:0 0 10px}
+textarea{min-height:160px;resize:vertical}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:10px;padding:10px 14px;cursor:pointer}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+button.danger{color:var(--warn)}
+button.small{padding:6px 10px;font-size:14px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:0 0 12px}
+.card.hl{border-color:var(--accent)}
+.tag{display:inline-block;background:transparent;border:1px solid var(--line);border-radius:99px;padding:1px 9px;margin:0 4px 4px 0;font-size:13px;color:var(--mute);cursor:pointer}
+.mute{color:var(--mute);font-size:14px}
+.label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:8px 0 4px}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0)}
+nav button{flex:1;border:0;border-radius:0;background:transparent;padding:14px 4px;color:var(--mute);font-size:14px}
+nav button.on{color:var(--accent);font-weight:700}
+.badge{background:var(--accent);color:var(--accent-ink);border-radius:99px;font-size:12px;padding:0 6px;margin-left:3px}
+#toast{position:fixed;left:50%;bottom:calc(76px + env(safe-area-inset-bottom,0));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:99px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.show{opacity:1}
+details summary{cursor:pointer;color:var(--mute);font-size:14px;margin-bottom:8px}
+.raw{white-space:pre-wrap;font-size:14px;color:var(--mute)}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<nav id="nav"></nav>
+<div id="toast"></div>
+<script>
+(function(){
+'use strict';
+var $=function(s){return document.querySelector(s)};
+var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
+var uid=function(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6)};
+var today=function(){return new Date().toISOString().slice(0,10)};
+
+var db;
+function load(){try{db=JSON.parse(localStorage.getItem('slipbox')||'null')}catch(e){db=null}
+  db=db||{};db.notes=db.notes||[];db.inbox=db.inbox||[];db.settings=db.settings||{};}
+function save(){try{localStorage.setItem('slipbox',JSON.stringify(db))}catch(e){toast('Could not save (storage full or blocked)')}}
+load();
+
+var state={tab:'capture',openId:null,q:''};
+var STOP=new Set('about above after again also because been before being between both cannot could does doing down during each from further have having here into just like more most much only other over same should some such than that their them then there these they this those through under until very what when where which while will with would your you the and for are but not was were has had its our out who why how can may'.split(' '));
+
+function words(t){var s=new Set();(String(t).toLowerCase().match(/[a-z]{4,}/g)||[]).forEach(function(w){if(!STOP.has(w))s.add(w)});return s}
+function noteWords(n){return words(n.title+' '+n.idea)}
+function noteById(id){return db.notes.find(function(n){return n.id===id})}
+
+// ---------- link suggestions (no AI needed) ----------
+function suggest(note,limit){
+  var mine=noteWords(note),out=[];
+  db.notes.forEach(function(o){
+    if(o.id===note.id||note.links.indexOf(o.id)>-1)return;
+    var sharedTags=o.tags.filter(function(t){return note.tags.indexOf(t)>-1});
+    var theirs=noteWords(o),sw=[];mine.forEach(function(w){if(theirs.has(w))sw.push(w)});
+    var score=sharedTags.length*3+sw.length;
+    if(score>0)out.push({note:o,score:score,why:sharedTags.concat(sw).slice(0,4)});
+  });
+  out.sort(function(a,b){return b.score-a.score});
+  return out.slice(0,limit||3);
+}
+function link(a,b){if(a.links.indexOf(b.id)<0)a.links.push(b.id);if(b.links.indexOf(a.id)<0)b.links.push(a.id)}
+function unlink(a,b){a.links=a.links.filter(function(x){return x!==b.id});b.links=b.links.filter(function(x){return x!==a.id})}
+
+// ---------- sorting a dump into atomic notes ----------
+function heuristic(raw){
+  var first=raw.trim().split(/(?<=[.!?])\s+|\n/)[0]||raw;
+  var title=first.length>70?first.slice(0,67).trim()+'...':first;
+  var tags=(raw.match(/#[a-z0-9_-]+/gi)||[]).map(function(t){return t.slice(1).toLowerCase()});
+  return [{id:uid(),title:title,idea:raw.replace(/#[a-z0-9_-]+/gi,'').trim(),tags:tags.slice(0,4)}];
+}
+async function aiSort(raw,source){
+  var key=db.settings.key;
+  var res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+    body:JSON.stringify({model:db.settings.model||'claude-haiku-4-5-20251001',max_tokens:1000,
+      system:'You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: 1 to 4 lowercase single words. One idea per note. Never invent facts that are not in the text.',
+      messages:[{role:'user',content:(source?'Source: '+source+'\n\n':'')+raw}]})});
+  if(!res.ok)throw new Error('API '+res.status);
+  var data=await res.json();
+  var txt=(data.content||[]).map(function(b){return b.text||''}).join('').replace(/```json|```/g,'').trim();
+  var arr=JSON.parse(txt);
+  return arr.slice(0,3).map(function(d){return {id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(d.tags||[]).map(function(t){return String(t).toLowerCase()}).slice(0,4)}});
+}
+async function processItem(item){
+  try{
+    item.drafts=db.settings.key?await aiSort(item.raw,item.source):heuristic(item.raw);
+  }catch(e){
+    item.drafts=heuristic(item.raw);toast('AI sort failed, used a basic draft');
+  }
+  item.status='done';save();refresh();
+}
+
+// ---------- views ----------
+function vCapture(){
+  return '<h1>Dump it</h1><p class="hint">Paste a highlight, a transcript, or a rambling thought. No formatting needed. I will turn it into notes for you to approve.</p>'+
+  '<textarea id="raw" placeholder="What did you just read or hear?"></textarea>'+
+  '<input id="src" placeholder="Source (book, podcast, link). Optional">'+
+  '<button class="primary" style="width:100%" data-a="capture">Add to inbox</button>'+
+  '<p class="mute" style="margin-top:14px">'+db.notes.length+' notes kept. '+db.inbox.length+' dumps waiting.'+(db.settings.key?'':' AI sorting is off. Add your key under More to turn it on.')+'</p>';
+}
+function vInbox(){
+  if(!db.inbox.length)return '<h1>Inbox</h1><p class="hint">Nothing waiting. Go dump something.</p>';
+  return '<h1>Inbox</h1><p class="hint">Keep what is worth keeping. Toss the rest.</p>'+db.inbox.map(function(it){
+    if(it.status!=='done'||!it.drafts)return '<div class="card"><p class="mute">Sorting...</p></div>';
+    return '<div class="card" data-item="'+it.id+'"><details><summary>Original dump'+(it.source?' ('+esc(it.source)+')':'')+'</summary><div class="raw">'+esc(it.raw)+'</div></details>'+
+    it.drafts.map(function(d){return '<div data-draft="'+d.id+'" style="border-top:1px solid var(--line);padding-top:10px;margin-top:10px">'+
+      '<input class="t" value="'+esc(d.title)+'" aria-label="Title">'+
+      '<textarea class="i" style="min-height:80px" aria-label="Idea">'+esc(d.idea)+'</textarea>'+
+      '<input class="g" value="'+esc(d.tags.join(', '))+'" placeholder="tags, comma separated" aria-label="Tags">'+
+      '<div class="row"><button class="primary" data-a="keep" data-item="'+it.id+'" data-draft="'+d.id+'">Keep</button><button class="danger" data-a="toss" data-item="'+it.id+'" data-draft="'+d.id+'">Toss</button></div></div>'}).join('')+'</div>';
+  }).join('');
+}
+function pickDaily(){
+  var d=db.settings.daily;
+  if(!d||d.date!==today()){
+    var ids=db.notes.slice().sort(function(a,b){return (a.lastReviewed||0)-(b.lastReviewed||0)}).slice(0,5).map(function(n){return n.id});
+    d=db.settings.daily={date:today(),ids:ids,done:[]};save();
+  }
+  return d;
+}
+function vDaily(){
+  if(db.notes.length<2)return '<h1>Daily 5</h1><p class="hint">Keep at least two notes and I will start suggesting connections here.</p>';
+  var d=pickDaily(),left=d.ids.filter(function(id){return d.done.indexOf(id)<0&&noteById(id)});
+  if(!left.length)return '<h1>Daily 5</h1><div class="card hl"><h2>Done for today</h2><p class="mute">'+d.done.length+' reviewed. Come back tomorrow.</p></div>';
+  var n=noteById(left[0]),s=suggest(n,1)[0],other,why;
+  if(s){other=s.note;why='Shared: '+s.why.map(esc).join(', ')}
+  else{var pool=db.notes.filter(function(o){return o.id!==n.id&&n.links.indexOf(o.id)<0});
+    if(pool.length){other=pool[Math.floor(Math.random()*pool.length)];why='No obvious overlap. Any connection?'}}
+  return '<h1>Daily 5 <span class="mute">('+(d.ids.length-left.length+1)+' of '+d.ids.length+')</span></h1>'+
+  '<div class="card"><div class="label">This note</div><h2>'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div></div>'+
+  (other?'<div class="card hl"><div class="label">Might connect to</div><h2>'+esc(other.title)+'</h2><div>'+esc(other.idea)+'</div><p class="mute">'+why+'</p>'+
+    '<div class="row"><button class="primary" data-a="dlink" data-n="'+n.id+'" data-o="'+other.id+'">Link them</button><button data-a="dskip" data-n="'+n.id+'">Skip</button></div></div>'
+   :'<div class="card"><p class="mute">Already linked to everything. Nice.</p><button data-a="dskip" data-n="'+n.id+'">Next</button></div>');
+}
+function chips(tags){return tags.map(function(t){return '<span class="tag" data-a="tag" data-t="'+esc(t)+'">#'+esc(t)+'</span>'}).join('')}
+function vNotes(){
+  if(state.openId&&noteById(state.openId))return vDetail(noteById(state.openId));
+  var q=state.q.toLowerCase().trim();
+  var list=db.notes.filter(function(n){return !q||(n.title+' '+n.idea+' '+n.tags.join(' ')).toLowerCase().indexOf(q)>-1}).sort(function(a,b){return b.created-a.created});
+  return '<h1>Notes</h1><input id="q" type="search" placeholder="Search notes or #tags" value="'+esc(state.q)+'">'+
+  (list.length?list.map(function(n){return '<div class="card"><h2 data-a="open" data-id="'+n.id+'" style="cursor:pointer">'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div><div style="margin-top:8px">'+chips(n.tags)+'<span class="mute">'+(n.links.length?n.links.length+' link'+(n.links.length>1?'s':''):'no links yet')+'</span></div></div>'}).join(''):'<p class="hint">'+(db.notes.length?'No matches.':'No notes yet.')+'</p>');
+}
+function vDetail(n){
+  var linked=n.links.map(noteById).filter(Boolean),sug=suggest(n,3);
+  return '<button class="small" data-a="back">Back</button><h1 style="margin-top:10px">Edit note</h1>'+
+  '<input data-f="title" data-id="'+n.id+'" value="'+esc(n.title)+'">'+
+  '<textarea data-f="idea" data-id="'+n.id+'" style="min-height:110px">'+esc(n.idea)+'</textarea>'+
+  '<input data-f="tags" data-id="'+n.id+'" value="'+esc(n.tags.join(', '))+'" placeholder="tags, comma separated">'+
+  (n.source?'<p class="mute">Source: '+esc(n.source)+'</p>':'')+
+  '<div class="label">Linked notes</div>'+(linked.length?linked.map(function(o){return '<div class="card"><b data-a="open" data-id="'+o.id+'" style="cursor:pointer">'+esc(o.title)+'</b> <button class="small danger" data-a="unlink" data-n="'+n.id+'" data-o="'+o.id+'">Unlink</button></div>'}).join(''):'<p class="mute">None yet.</p>')+
+  '<div class="label">Suggested links</div>'+(sug.length?sug.map(function(s){return '<div class="card"><b>'+esc(s.note.title)+'</b><div class="mute">Shared: '+s.why.map(esc).join(', ')+'</div><button class="small primary" data-a="dlink2" data-n="'+n.id+'" data-o="'+s.note.id+'">Link</button></div>'}).join(''):'<p class="mute">No suggestions right now.</p>')+
+  '<button class="danger" style="margin-top:16px" data-a="delnote" data-id="'+n.id+'">Delete note</button>';
+}
+function vMore(){
+  return '<h1>More</h1>'+
+  '<div class="card"><h2>AI sorting (optional)</h2><p class="hint">Paste your Anthropic API key to have dumps split into atomic notes automatically. It is stored only in this browser and sent only to api.anthropic.com. Without it, you get a basic draft you can edit.</p>'+
+  '<input id="key" type="password" placeholder="sk-ant-..." value="'+esc(db.settings.key||'')+'" autocomplete="off">'+
+  '<input id="model" placeholder="Model" value="'+esc(db.settings.model||'claude-haiku-4-5-20251001')+'">'+
+  '<button class="primary" data-a="savekey">Save settings</button></div>'+
+  '<div class="card"><h2>Back up and export</h2><p class="hint">Your notes live only in this browser. Back them up now and then.</p>'+
+  '<div class="row"><button data-a="exportmd">Export Markdown</button><button data-a="exportjson">Backup JSON</button></div>'+
+  '<div class="label">Restore from backup</div><input type="file" id="imp" accept="application/json"></div>';
+}
+
+function render(){
+  var v={capture:vCapture,inbox:vInbox,daily:vDaily,notes:vNotes,more:vMore}[state.tab]();
+  $('#app').innerHTML=v;
+  var tabs=[['capture','Dump'],['inbox','Inbox'],['daily','Daily 5'],['notes','Notes'],['more','More']];
+  $('#nav').innerHTML=tabs.map(function(t){return '<button class="'+(state.tab===t[0]?'on':'')+'" data-a="tab" data-t="'+t[0]+'">'+t[1]+(t[0]==='inbox'&&db.inbox.length?'<span class="badge">'+db.inbox.length+'</span>':'')+'</button>'}).join('');
+}
+function refresh(){var a=document.activeElement;if(a&&(a.id==='raw'||a.id==='src'))return;render()}
+var tt;function toast(m){var t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(tt);tt=setTimeout(function(){t.classList.remove('show')},2200)}
+
+function download(name,text,type){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:type}));a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000)}
+function parseTags(s){return s.split(',').map(function(t){return t.trim().toLowerCase().replace(/^#/,'')}).filter(Boolean).slice(0,8)}
+
+var A={
+  tab:function(b){state.tab=b.dataset.t;state.openId=null;render();window.scrollTo(0,0)},
+  capture:function(){
+    var raw=$('#raw').value.trim();if(!raw){toast('Nothing to add yet');return}
+    var item={id:uid(),raw:raw,source:$('#src').value.trim(),created:Date.now(),drafts:null,status:'processing'};
+    db.inbox.unshift(item);save();$('#raw').value='';$('#src').value='';toast('Added. Sorting...');render();processItem(item);
+  },
+  keep:function(b){
+    var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
+    var box=document.querySelector('[data-draft="'+b.dataset.draft+'"]');
+    var title=box.querySelector('.t').value.trim()||'Untitled';
+    db.notes.push({id:uid(),title:title,idea:box.querySelector('.i').value.trim(),tags:parseTags(box.querySelector('.g').value),source:it.source,created:Date.now(),links:[],lastReviewed:0});
+    it.drafts=it.drafts.filter(function(d){return d.id!==b.dataset.draft});
+    if(!it.drafts.length)db.inbox=db.inbox.filter(function(x){return x.id!==it.id});
+    save();toast('Kept');render();
+  },
+  toss:function(b){
+    var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
+    it.drafts=it.drafts.filter(function(d){return d.id!==b.dataset.draft});
+    if(!it.drafts.length)db.inbox=db.inbox.filter(function(x){return x.id!==it.id});
+    save();render();
+  },
+  dlink:function(b){var n=noteById(b.dataset.n),o=noteById(b.dataset.o);link(n,o);A.dskip(b)},
+  dskip:function(b){var n=noteById(b.dataset.n),d=pickDaily();if(n)n.lastReviewed=Date.now();if(d.done.indexOf(b.dataset.n)<0)d.done.push(b.dataset.n);save();render()},
+  dlink2:function(b){link(noteById(b.dataset.n),noteById(b.dataset.o));save();toast('Linked');render()},
+  unlink:function(b){unlink(noteById(b.dataset.n),noteById(b.dataset.o));save();render()},
+  open:function(b){state.tab='notes';state.openId=b.dataset.id;render();window.scrollTo(0,0)},
+  back:function(){state.openId=null;render()},
+  tag:function(b){state.tab='notes';state.openId=null;state.q='#'+b.dataset.t;render()},
+  delnote:function(b){if(!confirm('Delete this note?'))return;var n=noteById(b.dataset.id);db.notes.forEach(function(o){o.links=o.links.filter(function(x){return x!==n.id})});db.notes=db.notes.filter(function(x){return x.id!==n.id});state.openId=null;save();render()},
+  savekey:function(){db.settings.key=$('#key').value.trim();db.settings.model=$('#model').value.trim();save();toast('Saved');render()},
+  exportmd:function(){
+    var md=db.notes.slice().sort(function(a,b){return a.created-b.created}).map(function(n){
+      return '# '+n.title+'\n\n'+n.idea+'\n\n'+(n.tags.length?'Tags: '+n.tags.map(function(t){return '#'+t}).join(' ')+'\n':'')+(n.source?'Source: '+n.source+'\n':'')+(n.links.length?'Links: '+n.links.map(noteById).filter(Boolean).map(function(o){return '[['+o.title+']]'}).join(', ')+'\n':'')}).join('\n---\n\n');
+    download('slipbox-'+today()+'.md',md,'text/markdown');
+  },
+  exportjson:function(){var copy=JSON.parse(JSON.stringify(db));delete copy.settings.key;download('slipbox-backup-'+today()+'.json',JSON.stringify(copy,null,2),'application/json')}
+};
+
+document.addEventListener('click',function(e){var b=e.target.closest('[data-a]');if(b&&A[b.dataset.a])A[b.dataset.a](b)});
+document.addEventListener('input',function(e){if(e.target.id==='q'){state.q=e.target.value;var pos=e.target.selectionStart;render();var q=$('#q');q.focus();q.setSelectionRange(pos,pos)}});
+document.addEventListener('change',function(e){
+  var t=e.target;
+  if(t.dataset&&t.dataset.f){var n=noteById(t.dataset.id);if(!n)return;n[t.dataset.f]=t.dataset.f==='tags'?parseTags(t.value):t.value;save();toast('Saved')}
+  if(t.id==='imp'&&t.files[0]){var r=new FileReader();r.onload=function(){try{var d=JSON.parse(r.result);if(!Array.isArray(d.notes))throw 0;if(!confirm('Replace current notes with this backup?'))return;var key=db.settings.key,model=db.settings.model;db=d;db.inbox=db.inbox||[];db.settings=db.settings||{};if(key)db.settings.key=key;if(model)db.settings.model=model;save();toast('Restored');render()}catch(x){toast('That file is not a Slipbox backup')}};r.readAsText(t.files[0])}
+});
+
+// finish any dumps that were interrupted
+db.inbox.forEach(function(it){if(it.status!=='done'||!it.drafts){it.status='processing';processItem(it)}});
+render();
+})();
+</script>
+</body>
+</html>
