@@ -24,7 +24,7 @@ button.small{padding:6px 10px;font-size:14px}
 .card.hl{border-color:var(--accent)}
 .tag{display:inline-block;background:transparent;border:1px solid var(--line);border-radius:99px;padding:1px 9px;margin:0 4px 4px 0;font-size:13px;color:var(--mute);cursor:pointer}
 .mute{color:var(--mute);font-size:14px}
-.label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:8px 0 4px}
+.label{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:12px 0 4px}
 nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0)}
 nav button{flex:1;border:0;border-radius:0;background:transparent;padding:14px 4px;color:var(--mute);font-size:14px}
 nav button.on{color:var(--accent);font-weight:700}
@@ -35,6 +35,7 @@ nav button.on{color:var(--accent);font-weight:700}
 #status.warn{color:var(--warn)}
 details summary{cursor:pointer;color:var(--mute);font-size:14px;margin-bottom:8px}
 .raw{white-space:pre-wrap;font-size:14px;color:var(--mute)}
+.answer{white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -59,48 +60,96 @@ function saveLocal(){try{localStorage.setItem('slipbox',JSON.stringify(db))}catc
 function save(){saveLocal();scan();schedule()}
 load();
 
-var state={tab:'capture',openId:null,q:''};
+var state={tab:'capture',openId:null,q:'',lq:'',sugN:3,mode:'search',reason:null,ask:{q:'',text:'',used:[],loading:false,error:''}};
 var STOP=new Set('about above after again also because been before being between both cannot could does doing down during each from further have having here into just like more most much only other over same should some such than that their them then there these they this those through under until very what when where which while will with would your you the and for are but not was were has had its our out who why how can may'.split(' '));
 
 function words(t){var s=new Set();(String(t).toLowerCase().match(/[a-z]{4,}/g)||[]).forEach(function(w){if(!STOP.has(w))s.add(w)});return s}
 function noteWords(n){return words(n.title+' '+n.idea)}
 function noteById(id){return db.notes.find(function(n){return n.id===id})}
+function reasonOf(a,b){return (a.reasons&&a.reasons[b.id])||''}
+function setReason(a,b,t){
+  t=(t||'').trim();a.reasons=a.reasons||{};b.reasons=b.reasons||{};
+  if(t){a.reasons[b.id]=t;b.reasons[a.id]=t}else{delete a.reasons[b.id];delete b.reasons[a.id]}
+}
 
-// ---------- link suggestions (no AI needed) ----------
+// ---------- local matching (free, runs in the browser) ----------
+// Rare shared words count more than common ones; title matches and shared tags count extra.
+function idfMap(){
+  var df={},N=db.notes.length||1,idf={};
+  db.notes.forEach(function(n){noteWords(n).forEach(function(w){df[w]=(df[w]||0)+1})});
+  Object.keys(df).forEach(function(w){idf[w]=Math.log(1+N/df[w])});
+  return idf;
+}
+function scoreNote(qw,qtags,o,idf){
+  var s=0,why=[],w=noteWords(o),tw=words(o.title);
+  qw.forEach(function(x){if(w.has(x)){var v=idf[x]||1;s+=v;if(tw.has(x))s+=v*0.5;why.push(x)}});
+  o.tags.forEach(function(t){if(qtags.indexOf(t)>-1||qw.has(t)){s+=3;why.unshift(t)}});
+  return {score:s,why:why};
+}
 function suggest(note,limit){
-  var mine=noteWords(note),out=[];
+  var idf=idfMap(),qw=noteWords(note),out=[];
   db.notes.forEach(function(o){
     if(o.id===note.id||note.links.indexOf(o.id)>-1)return;
-    var sharedTags=o.tags.filter(function(t){return note.tags.indexOf(t)>-1});
-    var theirs=noteWords(o),sw=[];mine.forEach(function(w){if(theirs.has(w))sw.push(w)});
-    var score=sharedTags.length*3+sw.length;
-    if(score>0)out.push({note:o,score:score,why:sharedTags.concat(sw).slice(0,4)});
+    var r=scoreNote(qw,note.tags,o,idf);
+    if(r.score>0)out.push({note:o,score:r.score,why:r.why.slice(0,4)});
   });
   out.sort(function(a,b){return b.score-a.score});
   return out.slice(0,limit||3);
 }
 function link(a,b){if(a.links.indexOf(b.id)<0)a.links.push(b.id);if(b.links.indexOf(a.id)<0)b.links.push(a.id)}
-function unlink(a,b){a.links=a.links.filter(function(x){return x!==b.id});b.links=b.links.filter(function(x){return x!==a.id})}
+function unlink(a,b){
+  a.links=a.links.filter(function(x){return x!==b.id});b.links=b.links.filter(function(x){return x!==a.id});
+  if(a.reasons)delete a.reasons[b.id];if(b.reasons)delete b.reasons[a.id];
+}
 
-// ---------- sorting a dump into atomic notes ----------
+// ---------- Claude calls ----------
+var SORT_SYS='You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags, type. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: 1 to 4 lowercase single words. type: "source" if the note records what a source said or argued, or "idea" if it is the writer\'s own thought, reaction, or application; use "idea" when unclear. One idea per note. Never invent facts that are not in the text.';
+function trackUsage(model,u){
+  if(!u)return;
+  var mo=new Date().toISOString().slice(0,7),s=db.settings.usage;
+  if(!s||s.month!==mo)s=db.settings.usage={month:mo,calls:0,inTok:0,outTok:0,cost:0};
+  var p=/haiku/i.test(model)?[1,5]:[3,15];
+  s.calls++;s.inTok+=u.input_tokens||0;s.outTok+=u.output_tokens||0;
+  s.cost+=((u.input_tokens||0)*p[0]+(u.output_tokens||0)*p[1])/1e6;
+  saveLocal();
+}
+async function callClaude(o){
+  var key=db.settings.key;if(!key)throw new Error('Add your Anthropic API key under More first');
+  var model=db.settings.model||'claude-haiku-4-5-20251001';
+  var res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+    headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+    body:JSON.stringify({model:model,max_tokens:o.max||500,system:o.system,messages:[{role:'user',content:o.user}]})});
+  if(!res.ok){var m='';try{m=(await res.json()).error.message}catch(e){}throw new Error('Claude API '+res.status+(m?': '+m:''))}
+  var data=await res.json();trackUsage(model,data.usage);
+  return (data.content||[]).map(function(b){return b.text||''}).join('').trim();
+}
+function chunkText(raw,max){
+  var parts=raw.split(/\n+/),out=[],cur='';
+  parts.forEach(function(p){
+    while(p.length>max){if(cur){out.push(cur);cur=''}out.push(p.slice(0,max));p=p.slice(max)}
+    if(cur&&(cur+'\n'+p).length>max){out.push(cur);cur=p}else cur=cur?cur+'\n'+p:p;
+  });
+  if(cur)out.push(cur);
+  return out;
+}
 function heuristic(raw){
   var first=raw.trim().split('\n')[0]||raw;
   var m=first.match(/^.*?[.!?](\s|$)/);if(m)first=m[0].trim();
   var title=first.length>70?first.slice(0,67).trim()+'...':first;
   var tags=(raw.match(/#[a-z0-9_-]+/gi)||[]).map(function(t){return t.slice(1).toLowerCase()});
-  return [{id:uid(),title:title,idea:raw.replace(/#[a-z0-9_-]+/gi,'').trim(),tags:tags.slice(0,4)}];
+  return [{id:uid(),title:title,idea:raw.replace(/#[a-z0-9_-]+/gi,'').trim(),tags:tags.slice(0,4),type:'idea'}];
 }
 async function aiSort(raw,source){
-  var key=db.settings.key;
-  var res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-    body:JSON.stringify({model:db.settings.model||'claude-haiku-4-5-20251001',max_tokens:1000,
-      system:'You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: 1 to 4 lowercase single words. One idea per note. Never invent facts that are not in the text.',
-      messages:[{role:'user',content:(source?'Source: '+source+'\n\n':'')+raw}]})});
-  if(!res.ok)throw new Error('API '+res.status);
-  var data=await res.json();
-  var txt=(data.content||[]).map(function(b){return b.text||''}).join('').replace(/```json|```/g,'').trim();
-  var arr=JSON.parse(txt);
-  return arr.slice(0,3).map(function(d){return {id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(d.tags||[]).map(function(t){return String(t).toLowerCase()}).slice(0,4)}});
+  // Long dumps are split into chunks of at most 8,000 characters, and at most 6 chunks are sent.
+  var chunks=chunkText(raw,8000),cut=chunks.length>6,drafts=[];
+  if(cut)chunks=chunks.slice(0,6);
+  for(const c of chunks){
+    var txt=await callClaude({system:SORT_SYS,user:(source?'Source: '+source+'\n\n':'')+c,max:1000});
+    var arr=JSON.parse(txt.replace(/```json|```/g,'').trim());
+    arr.slice(0,3).forEach(function(d){drafts.push({id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(d.tags||[]).map(function(t){return String(t).toLowerCase()}).slice(0,4),type:d.type==='source'?'source':'idea'})});
+  }
+  if(cut)toast('Long dump: AI sorted the first part only. The full text is in the original.');
+  return drafts.slice(0,12);
 }
 async function processItem(item){
   try{
@@ -109,6 +158,20 @@ async function processItem(item){
     item.drafts=heuristic(item.raw);toast('AI sort failed, used a basic draft');
   }
   item.status='done';save();refresh();
+}
+async function aiReason(a,b){
+  return callClaude({system:'In one short sentence (under 20 words), explain how these two notes connect. Reply with only the sentence, no quotation marks.',
+    user:'Note A: '+a.title+'. '+a.idea.slice(0,500)+'\n\nNote B: '+b.title+'. '+b.idea.slice(0,500),max:80});
+}
+async function askNotes(q){
+  var idf=idfMap(),qw=words(q),ranked=[];
+  db.notes.forEach(function(o){var r=scoreNote(qw,[],o,idf);if(r.score>0)ranked.push({n:o,score:r.score})});
+  ranked.sort(function(a,b){return b.score-a.score});ranked=ranked.slice(0,15);
+  if(!ranked.length)return {text:'None of your notes seem to touch on that. Try other words from your own notes.',used:[]};
+  var ctx=ranked.map(function(r,i){return '['+(i+1)+'] '+r.n.title+' ('+(r.n.type==='source'?'source note':'my idea')+'): '+r.n.idea.slice(0,600)}).join('\n');
+  var text=await callClaude({system:'You answer questions using ONLY the numbered notes provided. Cite the notes you use with their numbers in square brackets, like [2]. Be concise (under 150 words). If the notes do not answer the question, say so plainly and do not guess. Notes marked "source note" record what a source said, not the writer\'s own view, so keep that distinction clear.',
+    user:'Notes:\n'+ctx+'\n\nQuestion: '+q.slice(0,500),max:600});
+  return {text:text,used:ranked.map(function(r){return r.n.id})};
 }
 
 // ---------- GitHub sync ----------
@@ -130,17 +193,24 @@ async function errMsg(r){
   if(r.status===403||r.status===404)return 'GitHub refused ('+r.status+'). Check the token has Contents read and write on this repo';
   return 'GitHub error '+r.status+(m?': '+m:'');
 }
+// Optional lines (type, reasons) are only written when set, so older note files stay unchanged.
 function serNote(n){
-  return '---\nid: '+JSON.stringify(n.id)+'\ntitle: '+JSON.stringify(n.title)+'\ntags: '+JSON.stringify(n.tags)+'\nsource: '+JSON.stringify(n.source||'')+'\ncreated: '+n.created+'\nreviewed: '+(n.lastReviewed||0)+'\nlinks: '+JSON.stringify(n.links)+'\n---\n'+String(n.idea||'').replace(/\s+$/,'')+'\n';
+  var rs={};(n.links||[]).forEach(function(id){if(n.reasons&&n.reasons[id])rs[id]=n.reasons[id]});
+  return '---\nid: '+JSON.stringify(n.id)+'\ntitle: '+JSON.stringify(n.title)+'\ntags: '+JSON.stringify(n.tags)+'\n'+
+    (n.type==='source'?'type: "source"\n':'')+
+    'source: '+JSON.stringify(n.source||'')+'\ncreated: '+n.created+'\nreviewed: '+(n.lastReviewed||0)+'\nlinks: '+JSON.stringify(n.links)+'\n'+
+    (Object.keys(rs).length?'reasons: '+JSON.stringify(rs)+'\n':'')+
+    '---\n'+String(n.idea||'').replace(/\s+$/,'')+'\n';
 }
 function parseNote(t){
   var m=t.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);if(!m)return null;
-  var n={tags:[],links:[],source:'',created:Date.now(),lastReviewed:0,title:'Untitled'};
+  var n={tags:[],links:[],reasons:{},type:'idea',source:'',created:Date.now(),lastReviewed:0,title:'Untitled'};
   m[1].split('\n').forEach(function(l){
     var i=l.indexOf(': ');if(i<0)return;var k=l.slice(0,i),v;
     try{v=JSON.parse(l.slice(i+2))}catch(e){return}
     if(k==='id')n.id=v;else if(k==='title')n.title=v;else if(k==='tags')n.tags=v;else if(k==='source')n.source=v;
     else if(k==='created')n.created=v;else if(k==='reviewed')n.lastReviewed=v;else if(k==='links')n.links=v;
+    else if(k==='type')n.type=v==='source'?'source':'idea';else if(k==='reasons')n.reasons=v||{};
   });
   n.idea=m[2].replace(/\n$/,'');
   return n.id?n:null;
@@ -179,7 +249,7 @@ function removeLocal(p){
   var id=p.split('/')[1].replace(/\.(md|json)$/,'');
   if(p.indexOf('notes/')===0){
     db.notes=db.notes.filter(function(n){return n.id!==id});
-    db.notes.forEach(function(o){o.links=o.links.filter(function(x){return x!==id})});
+    db.notes.forEach(function(o){o.links=o.links.filter(function(x){return x!==id});if(o.reasons)delete o.reasons[id]});
   }else db.inbox=db.inbox.filter(function(x){return x.id!==id});
   SY.changed=true;
 }
@@ -281,15 +351,19 @@ function vCapture(){
   '<button class="primary" style="width:100%" data-a="capture">Add to inbox</button>'+
   '<p class="mute" style="margin-top:14px">'+db.notes.length+' notes kept. '+db.inbox.length+' dumps waiting.'+(db.settings.key?'':' AI sorting is off. Add your key under More to turn it on.')+'</p>';
 }
+function typeSelect(cls,type,extra){
+  return '<select class="'+cls+'" '+(extra||'')+' aria-label="Note type"><option value="idea"'+(type==='source'?'':' selected')+'>My idea (what I think)</option><option value="source"'+(type==='source'?' selected':'')+'>Source note (what the source said)</option></select>';
+}
 function vInbox(){
   if(!db.inbox.length)return '<h1>Inbox</h1><p class="hint">Nothing waiting. Go dump something.</p>';
-  return '<h1>Inbox</h1><p class="hint">Keep what is worth keeping. Toss the rest.</p>'+db.inbox.slice().sort(function(a,b){return b.created-a.created}).map(function(it){
+  return '<h1>Inbox</h1><p class="hint">Edit if you like, check the type, then Keep or Toss.</p>'+db.inbox.slice().sort(function(a,b){return b.created-a.created}).map(function(it){
     if(it.status!=='done'||!it.drafts)return '<div class="card"><p class="mute">Sorting...</p></div>';
     return '<div class="card" data-item="'+it.id+'"><details><summary>Original dump'+(it.source?' ('+esc(it.source)+')':'')+'</summary><div class="raw">'+esc(it.raw)+'</div></details>'+
     it.drafts.map(function(d){return '<div data-draft="'+d.id+'" style="border-top:1px solid var(--line);padding-top:10px;margin-top:10px">'+
       '<input class="t" value="'+esc(d.title)+'" aria-label="Title">'+
       '<textarea class="i" style="min-height:80px" aria-label="Idea">'+esc(d.idea)+'</textarea>'+
       '<input class="g" value="'+esc(d.tags.join(', '))+'" placeholder="tags, comma separated" aria-label="Tags">'+
+      typeSelect('ty',d.type)+
       '<div class="row"><button class="primary" data-a="keep" data-item="'+it.id+'" data-draft="'+d.id+'">Keep</button><button class="danger" data-a="toss" data-item="'+it.id+'" data-draft="'+d.id+'">Toss</button></div></div>'}).join('')+'</div>';
   }).join('');
 }
@@ -303,7 +377,16 @@ function pickDaily(){
 }
 function vDaily(){
   if(db.notes.length<2)return '<h1>Daily 5</h1><p class="hint">Keep at least two notes and I will start suggesting connections here.</p>';
-  var d=pickDaily(),left=d.ids.filter(function(id){return d.done.indexOf(id)<0&&noteById(id)});
+  var d=pickDaily();
+  if(state.reason){
+    var ra=noteById(state.reason.n),rb=noteById(state.reason.o);
+    if(ra&&rb)return '<h1>Why do these connect?</h1><div class="card"><h2>'+esc(ra.title)+'</h2><div class="mute">and</div><h2>'+esc(rb.title)+'</h2></div>'+
+      '<textarea id="rtext" style="min-height:80px" placeholder="One line. Optional.">'+esc(reasonOf(ra,rb))+'</textarea>'+
+      (db.settings.key?'<button style="width:100%;margin-bottom:10px" data-a="rsuggest">Suggest reason</button>':'')+
+      '<div class="row"><button class="primary" data-a="rsave">Save and next</button><button data-a="rskip">Skip reason</button></div>';
+    state.reason=null;
+  }
+  var left=d.ids.filter(function(id){return d.done.indexOf(id)<0&&noteById(id)});
   if(!left.length){
     var more=db.notes.some(function(n){return d.ids.indexOf(n.id)<0});
     return '<h1>Daily 5</h1><div class="card hl"><h2>Round complete</h2><p class="mute">'+d.done.length+' reviewed today.'+(more?' In the zone? Keep going.':' You have been through every note.')+'</p>'+
@@ -320,36 +403,65 @@ function vDaily(){
    :'<div class="card"><p class="mute">Already linked to everything. Nice.</p><button data-a="dskip" data-n="'+n.id+'">Next</button></div>');
 }
 function chips(tags){return tags.map(function(t){return '<span class="tag" data-a="tag" data-t="'+esc(t)+'">#'+esc(t)+'</span>'}).join('')}
+function answerHtml(){
+  var a=state.ask;
+  if(a.error)return '<p style="color:var(--warn)">'+esc(a.error)+'</p>';
+  if(!a.text)return '';
+  var cited={},order=[];
+  var html=esc(a.text).replace(/\[(\d+)\]/g,function(m,k){
+    var id=a.used[+k-1];if(!id||!noteById(id))return m;
+    if(!cited[id]){cited[id]=1;order.push(id)}
+    return '<span class="tag" data-a="open" data-id="'+id+'">'+k+'</span>';
+  });
+  return '<div class="card hl"><div class="answer">'+html+'</div></div>'+
+    (order.length?'<div class="label">Notes used</div>'+order.map(function(id){return '<div class="card"><b data-a="open" data-id="'+id+'" style="cursor:pointer">'+esc(noteById(id).title)+'</b></div>'}).join(''):'');
+}
 function vNotes(){
   if(state.openId&&noteById(state.openId))return vDetail(noteById(state.openId));
+  var tog='<div class="row" style="margin-bottom:10px"><button class="'+(state.mode==='search'?'primary':'')+'" data-a="mode" data-m="search">Search</button><button class="'+(state.mode==='ask'?'primary':'')+'" data-a="mode" data-m="ask">Ask</button></div>';
+  if(state.mode==='ask')return '<h1>Notes</h1>'+tog+
+    '<p class="hint">Ask a question. Claude answers using only your notes and shows which ones it used.</p>'+
+    '<textarea id="ask" style="min-height:90px" placeholder="What have I written about...?">'+esc(state.ask.q)+'</textarea>'+
+    '<button class="primary" style="width:100%;margin-bottom:12px" data-a="ask">'+(state.ask.loading?'Thinking...':'Ask')+'</button>'+answerHtml();
   var q=state.q.toLowerCase().trim();
   var list=db.notes.filter(function(n){return !q||(n.title+' '+n.idea+' '+n.tags.map(function(t){return '#'+t}).join(' ')+' '+n.tags.join(' ')).toLowerCase().indexOf(q)>-1}).sort(function(a,b){return b.created-a.created});
-  return '<h1>Notes</h1><input id="q" type="search" placeholder="Search notes or #tags" value="'+esc(state.q)+'">'+
-  (list.length?list.map(function(n){return '<div class="card"><h2 data-a="open" data-id="'+n.id+'" style="cursor:pointer">'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div><div style="margin-top:8px">'+chips(n.tags)+'<span class="mute">'+(n.links.length?n.links.length+' link'+(n.links.length>1?'s':''):'no links yet')+'</span></div></div>'}).join(''):'<p class="hint">'+(db.notes.length?'No matches.':'No notes yet.')+'</p>');
+  return '<h1>Notes</h1>'+tog+'<input id="q" type="search" placeholder="Search notes or #tags" value="'+esc(state.q)+'">'+
+  (list.length?list.map(function(n){return '<div class="card"><h2 data-a="open" data-id="'+n.id+'" style="cursor:pointer">'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div><div style="margin-top:8px">'+(n.type==='source'?'<span class="tag" style="cursor:default">source note</span>':'')+chips(n.tags)+'<span class="mute">'+(n.links.length?n.links.length+' link'+(n.links.length>1?'s':''):'no links yet')+'</span></div></div>'}).join(''):'<p class="hint">'+(db.notes.length?'No matches.':'No notes yet.')+'</p>');
 }
 function vDetail(n){
-  var linked=n.links.map(noteById).filter(Boolean),sug=suggest(n,3);
+  var linked=n.links.map(noteById).filter(Boolean),all=suggest(n,1000),sug=all.slice(0,state.sugN),hasKey=!!db.settings.key;
+  var lq=state.lq.toLowerCase().trim();
+  var cand=lq?db.notes.filter(function(o){return o.id!==n.id&&n.links.indexOf(o.id)<0&&(o.title+' '+o.idea+' '+o.tags.join(' ')).toLowerCase().indexOf(lq)>-1}).slice(0,8):[];
   return '<button class="small" data-a="back">Back</button><h1 style="margin-top:10px">Edit note</h1>'+
   '<input data-f="title" data-id="'+n.id+'" value="'+esc(n.title)+'">'+
   '<textarea data-f="idea" data-id="'+n.id+'" style="min-height:110px">'+esc(n.idea)+'</textarea>'+
   '<input data-f="tags" data-id="'+n.id+'" value="'+esc(n.tags.join(', '))+'" placeholder="tags, comma separated">'+
+  typeSelect('',n.type,'data-f="type" data-id="'+n.id+'"')+
   (n.source?'<p class="mute">Source: '+esc(n.source)+'</p>':'')+
-  '<div class="label">Linked notes</div>'+(linked.length?linked.map(function(o){return '<div class="card"><b data-a="open" data-id="'+o.id+'" style="cursor:pointer">'+esc(o.title)+'</b> <button class="small danger" data-a="unlink" data-n="'+n.id+'" data-o="'+o.id+'">Unlink</button></div>'}).join(''):'<p class="mute">None yet.</p>')+
-  '<div class="label">Suggested links</div>'+(sug.length?sug.map(function(s){return '<div class="card"><b>'+esc(s.note.title)+'</b><div class="mute">Shared: '+s.why.map(esc).join(', ')+'</div><button class="small primary" data-a="dlink2" data-n="'+n.id+'" data-o="'+s.note.id+'">Link</button></div>'}).join(''):'<p class="mute">No suggestions right now.</p>')+
+  '<div class="label">Linked notes ('+linked.length+')</div>'+(linked.length?linked.map(function(o){return '<div class="card"><b data-a="open" data-id="'+o.id+'" style="cursor:pointer">'+esc(o.title)+'</b> <button class="small danger" data-a="unlink" data-n="'+n.id+'" data-o="'+o.id+'">Unlink</button>'+
+    '<input data-r="1" data-n="'+n.id+'" data-o="'+o.id+'" value="'+esc(reasonOf(n,o))+'" placeholder="Why do these connect? (optional)" style="margin:8px 0 6px">'+
+    (hasKey?'<button class="small" data-a="rsuggest2" data-n="'+n.id+'" data-o="'+o.id+'">Suggest reason</button>':'')+'</div>'}).join(''):'<p class="mute">None yet.</p>')+
+  '<div class="label">Link any note</div><input id="lq" type="search" placeholder="Search your notes to link" value="'+esc(state.lq)+'">'+
+  cand.map(function(o){return '<div class="card"><b>'+esc(o.title)+'</b> <button class="small primary" data-a="dlink2" data-n="'+n.id+'" data-o="'+o.id+'">Link</button></div>'}).join('')+
+  '<div class="label">Suggested links ('+all.length+')</div>'+(sug.length?sug.map(function(s){return '<div class="card"><b>'+esc(s.note.title)+'</b><div class="mute">Shared: '+s.why.map(esc).join(', ')+'</div><button class="small primary" data-a="dlink2" data-n="'+n.id+'" data-o="'+s.note.id+'">Link</button></div>'}).join(''):'<p class="mute">No suggestions right now.</p>')+
+  (all.length>sug.length?'<button style="width:100%" data-a="moresug">Show 5 more</button>':'')+
   '<button class="danger" style="margin-top:16px" data-a="delnote" data-id="'+n.id+'">Delete note</button>';
 }
 function vMore(){
-  var g=db.settings.gh||{};
+  var g=db.settings.gh||{},u=db.settings.usage,mo=new Date().toISOString().slice(0,7);
+  if(!u||u.month!==mo)u={calls:0,inTok:0,outTok:0,cost:0};
   return '<h1>More</h1>'+
   '<div class="card"><h2>GitHub sync</h2><p class="hint">Saves every change to your private notes repo, so nothing depends on this browser. Use a fine-grained token limited to that one repo (Contents: read and write). The token stays on this device. Set up the same repo and token on each device to share notes.</p>'+
   '<input id="gho" placeholder="GitHub username" value="'+esc(g.owner||'ryansmithsays')+'" autocomplete="off">'+
   '<input id="ghr" placeholder="Notes repo" value="'+esc(g.repo||'slipbox-notes')+'" autocomplete="off">'+
   '<input id="ght" type="password" placeholder="'+(g.token?'Token saved. Paste a new one to replace it':'Fine-grained token')+'" autocomplete="off">'+
   '<div class="row"><button class="primary" data-a="savegh">'+(g.token?'Save and sync now':'Connect and sync')+'</button>'+(g.token?'<button class="danger" data-a="offgh">Disconnect</button>':'')+'</div></div>'+
-  '<div class="card"><h2>AI sorting (optional)</h2><p class="hint">Paste your Anthropic API key to have dumps split into atomic notes automatically. It is stored only in this browser and sent only to api.anthropic.com. Without it, you get a basic draft you can edit.</p>'+
+  '<div class="card"><h2>AI settings</h2><p class="hint">Your Anthropic API key powers sorting, link reasons, and Ask. It is stored only in this browser and sent only to api.anthropic.com. Without it, dumps get a basic draft you can edit. Claude only runs when you add a dump or tap a Suggest or Ask button.</p>'+
   '<input id="key" type="password" placeholder="sk-ant-..." value="'+esc(db.settings.key||'')+'" autocomplete="off">'+
   '<input id="model" placeholder="Model" value="'+esc(db.settings.model||'claude-haiku-4-5-20251001')+'">'+
   '<button class="primary" data-a="savekey">Save AI settings</button></div>'+
+  '<div class="card"><h2>AI usage this month</h2><p class="mute">'+u.calls+' calls, '+u.inTok.toLocaleString()+' tokens in, '+u.outTok.toLocaleString()+' out. About $'+u.cost.toFixed(3)+'.</p>'+
+  '<p class="hint">An estimate counted on this device only (Haiku rates, or Sonnet-class rates for other models). The Anthropic console shows your exact bill, and you can set a monthly spend limit there.</p></div>'+
   '<div class="card"><h2>Export and restore</h2><p class="hint">Your notes are also plain Markdown files in the notes repo. These are extra copies.</p>'+
   '<div class="row"><button data-a="exportmd">Export Markdown</button><button data-a="exportjson">Backup JSON</button></div>'+
   '<div class="label">Restore from backup</div><input type="file" id="imp" accept="application/json"></div>';
@@ -362,10 +474,16 @@ function render(){
   $('#nav').innerHTML=tabs.map(function(t){return '<button class="'+(state.tab===t[0]?'on':'')+'" data-a="tab" data-t="'+t[0]+'">'+t[1]+(t[0]==='inbox'&&db.inbox.length?'<span class="badge">'+db.inbox.length+'</span>':'')+'</button>'}).join('');
 }
 function refresh(){var a=document.activeElement;if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;render()}
-var tt;function toast(m){var t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(tt);tt=setTimeout(function(){t.classList.remove('show')},2200)}
+var tt;function toast(m){var t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(tt);tt=setTimeout(function(){t.classList.remove('show')},2600)}
 
 function download(name,text,type){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:type}));a.download=name;a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000)}
 function parseTags(s){return s.split(',').map(function(t){return t.trim().toLowerCase().replace(/^#/,'')}).filter(Boolean).slice(0,8)}
+function advance(id){
+  var n=noteById(id),d=pickDaily();
+  if(n)n.lastReviewed=Date.now();
+  if(d.done.indexOf(id)<0)d.done.push(id);
+  state.reason=null;save();render();
+}
 
 var A={
   tab:function(b){state.tab=b.dataset.t;state.openId=null;render();window.scrollTo(0,0)},
@@ -378,7 +496,7 @@ var A={
     var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
     var box=document.querySelector('[data-draft="'+b.dataset.draft+'"]');
     var title=box.querySelector('.t').value.trim()||'Untitled';
-    db.notes.push({id:uid(),title:title,idea:box.querySelector('.i').value.trim(),tags:parseTags(box.querySelector('.g').value),source:it.source,created:Date.now(),links:[],lastReviewed:0});
+    db.notes.push({id:uid(),title:title,idea:box.querySelector('.i').value.trim(),tags:parseTags(box.querySelector('.g').value),type:box.querySelector('.ty').value==='source'?'source':'idea',source:it.source,created:Date.now(),links:[],reasons:{},lastReviewed:0});
     it.drafts=it.drafts.filter(function(d){return d.id!==b.dataset.draft});
     if(!it.drafts.length)db.inbox=db.inbox.filter(function(x){return x.id!==it.id});
     save();toast('Kept');render();
@@ -389,8 +507,18 @@ var A={
     if(!it.drafts.length)db.inbox=db.inbox.filter(function(x){return x.id!==it.id});
     save();render();
   },
-  dlink:function(b){var n=noteById(b.dataset.n),o=noteById(b.dataset.o);link(n,o);A.dskip(b)},
-  dskip:function(b){var n=noteById(b.dataset.n),d=pickDaily();if(n)n.lastReviewed=Date.now();if(d.done.indexOf(b.dataset.n)<0)d.done.push(b.dataset.n);save();render()},
+  dlink:function(b){var n=noteById(b.dataset.n),o=noteById(b.dataset.o);link(n,o);save();state.reason={n:n.id,o:o.id};render()},
+  dskip:function(b){advance(b.dataset.n)},
+  rsave:function(){var r=state.reason;if(!r)return;var a=noteById(r.n),b=noteById(r.o);if(a&&b)setReason(a,b,$('#rtext').value);advance(r.n)},
+  rskip:function(){if(state.reason)advance(state.reason.n)},
+  rsuggest:async function(){
+    var r=state.reason;if(!r)return;
+    try{toast('Asking Claude...');var t=await aiReason(noteById(r.n),noteById(r.o));var el=$('#rtext');if(el)el.value=t}catch(e){toast(e.message)}
+  },
+  rsuggest2:async function(b){
+    var a=noteById(b.dataset.n),o=noteById(b.dataset.o);if(!a||!o)return;
+    try{toast('Asking Claude...');setReason(a,o,await aiReason(a,o));save();render()}catch(e){toast(e.message)}
+  },
   moreDaily:function(){
     var d=pickDaily();
     var ids=db.notes.filter(function(n){return d.ids.indexOf(n.id)<0}).sort(function(a,b){return (a.lastReviewed||0)-(b.lastReviewed||0)}).slice(0,5).map(function(n){return n.id});
@@ -399,10 +527,24 @@ var A={
   },
   dlink2:function(b){link(noteById(b.dataset.n),noteById(b.dataset.o));save();toast('Linked');render()},
   unlink:function(b){unlink(noteById(b.dataset.n),noteById(b.dataset.o));save();render()},
-  open:function(b){state.tab='notes';state.openId=b.dataset.id;render();window.scrollTo(0,0)},
+  moresug:function(){state.sugN+=5;render()},
+  open:function(b){state.tab='notes';state.openId=b.dataset.id;state.lq='';state.sugN=3;render();window.scrollTo(0,0)},
   back:function(){state.openId=null;render()},
-  tag:function(b){state.tab='notes';state.openId=null;state.q='#'+b.dataset.t;render()},
-  delnote:function(b){if(!confirm('Delete this note?'))return;var n=noteById(b.dataset.id);db.notes.forEach(function(o){o.links=o.links.filter(function(x){return x!==n.id})});db.notes=db.notes.filter(function(x){return x.id!==n.id});state.openId=null;save();render()},
+  tag:function(b){state.tab='notes';state.mode='search';state.openId=null;state.q='#'+b.dataset.t;render()},
+  mode:function(b){state.mode=b.dataset.m;render()},
+  ask:async function(){
+    var q=$('#ask').value.trim();if(!q){toast('Type a question first');return}
+    state.ask.q=q;state.ask.text='';state.ask.used=[];state.ask.error='';
+    if(!db.settings.key){state.ask.error='Add your Anthropic API key under More to use Ask.';render();return}
+    state.ask.loading=true;render();
+    try{var r=await askNotes(q);state.ask.text=r.text;state.ask.used=r.used}catch(e){state.ask.error=e.message}
+    state.ask.loading=false;render();
+  },
+  delnote:function(b){
+    if(!confirm('Delete this note?'))return;var n=noteById(b.dataset.id);
+    db.notes.forEach(function(o){o.links=o.links.filter(function(x){return x!==n.id});if(o.reasons)delete o.reasons[n.id]});
+    db.notes=db.notes.filter(function(x){return x.id!==n.id});state.openId=null;save();render();
+  },
   savekey:function(){db.settings.key=$('#key').value.trim();db.settings.model=$('#model').value.trim();saveLocal();toast('Saved');render()},
   savegh:function(){
     var o=$('#gho').value.trim(),r=$('#ghr').value.trim(),t=$('#ght').value.trim()||(db.settings.gh&&db.settings.gh.token)||'';
@@ -416,20 +558,25 @@ var A={
   syncnow:function(){if(!gh()){state.tab='more';render();return}flush()},
   exportmd:function(){
     var md=db.notes.slice().sort(function(a,b){return a.created-b.created}).map(function(n){
-      return '# '+n.title+'\n\n'+n.idea+'\n\n'+(n.tags.length?'Tags: '+n.tags.map(function(t){return '#'+t}).join(' ')+'\n':'')+(n.source?'Source: '+n.source+'\n':'')+(n.links.length?'Links: '+n.links.map(noteById).filter(Boolean).map(function(o){return '[['+o.title+']]'}).join(', ')+'\n':'')}).join('\n---\n\n');
+      return '# '+n.title+'\n\n'+n.idea+'\n\n'+(n.type==='source'?'Type: source note\n':'')+(n.tags.length?'Tags: '+n.tags.map(function(t){return '#'+t}).join(' ')+'\n':'')+(n.source?'Source: '+n.source+'\n':'')+
+      (n.links.length?'Links: '+n.links.map(noteById).filter(Boolean).map(function(o){var r=reasonOf(n,o);return '[['+o.title+']]'+(r?' ('+r+')':'')}).join(', ')+'\n':'')}).join('\n---\n\n');
     download('slipbox-'+today()+'.md',md,'text/markdown');
   },
   exportjson:function(){var copy=JSON.parse(JSON.stringify(db));delete copy.settings.key;delete copy.settings.gh;delete copy.sync;download('slipbox-backup-'+today()+'.json',JSON.stringify(copy,null,2),'application/json')}
 };
 
 document.addEventListener('click',function(e){var b=e.target.closest('[data-a]');if(b&&A[b.dataset.a])A[b.dataset.a](b)});
-document.addEventListener('input',function(e){if(e.target.id==='q'){state.q=e.target.value;var pos=e.target.selectionStart;render();var q=$('#q');q.focus();q.setSelectionRange(pos,pos)}});
+document.addEventListener('input',function(e){
+  var id=e.target.id;
+  if(id==='q'||id==='lq'){state[id]=e.target.value;var pos=e.target.selectionStart;render();var el=$('#'+id);if(el){el.focus();el.setSelectionRange(pos,pos)}}
+});
 document.addEventListener('change',function(e){
   var t=e.target;
+  if(t.dataset&&t.dataset.r){var a=noteById(t.dataset.n),o=noteById(t.dataset.o);if(a&&o){setReason(a,o,t.value);save();toast('Saved')}return}
   if(t.dataset&&t.dataset.f){var n=noteById(t.dataset.id);if(!n)return;n[t.dataset.f]=t.dataset.f==='tags'?parseTags(t.value):t.value;save();toast('Saved')}
   if(t.id==='imp'&&t.files[0]){var r=new FileReader();r.onload=function(){try{
     var d=JSON.parse(r.result);if(!Array.isArray(d.notes))throw 0;if(!confirm('Replace current notes with this backup?'))return;
-    var keep={key:db.settings.key,model:db.settings.model,gh:db.settings.gh},oldShas=db.sync.shas;
+    var keep={key:db.settings.key,model:db.settings.model,gh:db.settings.gh,usage:db.settings.usage},oldShas=db.sync.shas;
     db=d;db.inbox=db.inbox||[];db.settings=db.settings||{};
     Object.keys(keep).forEach(function(k){if(keep[k]!==undefined)db.settings[k]=keep[k]});
     db.sync={shas:oldShas,h:{},dirty:{}};
