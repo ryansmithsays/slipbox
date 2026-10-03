@@ -60,7 +60,7 @@ function saveLocal(){try{localStorage.setItem('slipbox',JSON.stringify(db))}catc
 function save(){saveLocal();scan();schedule()}
 load();
 
-var state={tab:'capture',openId:null,q:'',lq:'',sugN:3,mode:'search',reason:null,ask:{q:'',text:'',used:[],loading:false,error:''}};
+var state={tab:'capture',openId:null,q:'',lq:'',sugN:3,mode:'search',reason:null,ask:{q:'',text:'',used:[],loading:false,error:'',qid:null,saved:null}};
 var STOP=new Set('about above after again also because been before being between both cannot could does doing down during each from further have having here into just like more most much only other over same should some such than that their them then there these they this those through under until very what when where which while will with would your you the and for are but not was were has had its our out who why how can may'.split(' '));
 
 function words(t){var s=new Set();(String(t).toLowerCase().match(/[a-z]{4,}/g)||[]).forEach(function(w){if(!STOP.has(w))s.add(w)});return s}
@@ -70,6 +70,20 @@ function reasonOf(a,b){return (a.reasons&&a.reasons[b.id])||''}
 function setReason(a,b,t){
   t=(t||'').trim();a.reasons=a.reasons||{};b.reasons=b.reasons||{};
   if(t){a.reasons[b.id]=t;b.reasons[a.id]=t}else{delete a.reasons[b.id];delete b.reasons[a.id]}
+}
+// Note types: idea (default), source, question, hub.
+function normType(t){return (t==='source'||t==='question'||t==='hub')?t:'idea'}
+function typeLabel(n){
+  if(n.type==='source')return 'source note';
+  if(n.type==='question')return n.status==='answered'?'question: answered':'question: open';
+  if(n.type==='hub')return 'hub';
+  return '';
+}
+function ctxLabel(n){
+  if(n.type==='source')return 'source note';
+  if(n.type==='hub')return 'hub note (my framing)';
+  if(/^Slipbox Ask/.test(n.source||''))return 'earlier synthesized answer';
+  return 'my idea';
 }
 
 // ---------- local matching (free, runs in the browser) ----------
@@ -105,7 +119,7 @@ function unlink(a,b){
 
 // ---------- Claude calls ----------
 var TOPICS=['storytelling','philosophy','politics','facts'];
-var SORT_SYS='You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags, type. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: an array of 1 to 4 lowercase single words. The first tag must be the closest topic from this list: storytelling, philosophy, politics, facts. Use facts for standalone facts that fit none of the others. Any remaining tags are free-form. type: "source" if the note records what a source said or argued, or "idea" if it is the writer\'s own thought, reaction, or application; use "idea" when unclear. One idea per note. Never invent facts that are not in the text.';
+var SORT_SYS='You turn messy captured text (highlights, voice transcripts, rambling thoughts) into Zettelkasten atomic notes. Return ONLY a JSON array, no code fences, of 1 to 3 objects with keys title, idea, tags, type. title: a short claim-style sentence under 70 characters. idea: 1 to 3 plain sentences, self-contained, in the writer\'s own voice. tags: an array of 1 to 4 lowercase single words. The first tag must be the closest topic from this list: storytelling, philosophy, politics, facts. Use facts for standalone facts that fit none of the others. Any remaining tags are free-form. type: "source" if the note records what a source said or argued, "question" if it is an open question the writer is asking rather than a statement, or "idea" if it is the writer\'s own thought, reaction, or application; use "idea" when unclear. One idea per note. Never invent facts that are not in the text.';
 function trackUsage(model,u){
   if(!u)return;
   var mo=new Date().toISOString().slice(0,7),s=db.settings.usage;
@@ -148,7 +162,7 @@ async function aiSort(raw,source){
   for(const c of chunks){
     var txt=await callClaude({system:SORT_SYS,user:(source?'Source: '+source+'\n\n':'')+c,max:1000});
     var arr=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    arr.slice(0,3).forEach(function(d){drafts.push({id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(function(t){t=(t||[]).map(function(x){return String(x).toLowerCase()});var i=t.findIndex(function(x){return TOPICS.indexOf(x)>-1});if(i>0)t.unshift(t.splice(i,1)[0]);return t.slice(0,4)})(d.tags),type:d.type==='source'?'source':'idea'})});
+    arr.slice(0,3).forEach(function(d){drafts.push({id:uid(),title:String(d.title||'').slice(0,100),idea:String(d.idea||''),tags:(function(t){t=(t||[]).map(function(x){return String(x).toLowerCase()});var i=t.findIndex(function(x){return TOPICS.indexOf(x)>-1});if(i>0)t.unshift(t.splice(i,1)[0]);return t.slice(0,4)})(d.tags),type:(d.type==='source'||d.type==='question')?d.type:'idea'})});
   }
   if(cut)toast('Long dump: AI sorted the first part only. The full text is in the original.');
   return drafts.slice(0,12);
@@ -167,11 +181,12 @@ async function aiReason(a,b){
 }
 async function askNotes(q){
   var idf=idfMap(),qw=words(q),ranked=[];
-  db.notes.forEach(function(o){var r=scoreNote(qw,[],o,idf);if(r.score>0)ranked.push({n:o,score:r.score})});
+  // Question notes are things the writer is still asking, not evidence, so they are left out.
+  db.notes.forEach(function(o){if(o.type==='question')return;var r=scoreNote(qw,[],o,idf);if(r.score>0)ranked.push({n:o,score:r.score})});
   ranked.sort(function(a,b){return b.score-a.score});ranked=ranked.slice(0,15);
   if(!ranked.length)return {text:'None of your notes seem to touch on that. Try other words from your own notes.',used:[]};
-  var ctx=ranked.map(function(r,i){return '['+(i+1)+'] '+r.n.title+' ('+(r.n.type==='source'?'source note':'my idea')+'): '+r.n.idea.slice(0,600)}).join('\n');
-  var text=await callClaude({system:'You answer questions using ONLY the numbered notes provided. Cite the notes you use with their numbers in square brackets, like [2]. Be concise (under 150 words). If the notes do not answer the question, say so plainly and do not guess. Notes marked "source note" record what a source said, not the writer\'s own view, so keep that distinction clear.',
+  var ctx=ranked.map(function(r,i){return '['+(i+1)+'] '+r.n.title+' ('+ctxLabel(r.n)+'): '+r.n.idea.slice(0,600)}).join('\n');
+  var text=await callClaude({system:'You answer questions using ONLY the numbered notes provided. Cite the notes you use with their numbers in square brackets, like [2]. Be concise (under 150 words). If the notes do not answer the question, say so plainly and do not guess. Notes marked "source note" record what a source said, not the writer\'s own view, so keep that distinction clear. Notes marked "earlier synthesized answer" are summaries made earlier from other notes, so treat them as weaker evidence than the notes they came from.',
     user:'Notes:\n'+ctx+'\n\nQuestion: '+q.slice(0,500),max:600});
   return {text:text,used:ranked.map(function(r){return r.n.id})};
 }
@@ -195,11 +210,13 @@ async function errMsg(r){
   if(r.status===403||r.status===404)return 'GitHub refused ('+r.status+'). Check the token has Contents read and write on this repo';
   return 'GitHub error '+r.status+(m?': '+m:'');
 }
-// Optional lines (type, reasons) are only written when set, so older note files stay unchanged.
+// Optional lines (type, status, reasons) are only written when set, so older note files stay unchanged.
 function serNote(n){
   var rs={};(n.links||[]).forEach(function(id){if(n.reasons&&n.reasons[id])rs[id]=n.reasons[id]});
+  var ty=normType(n.type);
   return '---\nid: '+JSON.stringify(n.id)+'\ntitle: '+JSON.stringify(n.title)+'\ntags: '+JSON.stringify(n.tags)+'\n'+
-    (n.type==='source'?'type: "source"\n':'')+
+    (ty!=='idea'?'type: '+JSON.stringify(ty)+'\n':'')+
+    (ty==='question'?'status: '+JSON.stringify(n.status==='answered'?'answered':'open')+'\n':'')+
     'source: '+JSON.stringify(n.source||'')+'\ncreated: '+n.created+'\nreviewed: '+(n.lastReviewed||0)+'\nlinks: '+JSON.stringify(n.links)+'\n'+
     (Object.keys(rs).length?'reasons: '+JSON.stringify(rs)+'\n':'')+
     '---\n'+String(n.idea||'').replace(/\s+$/,'')+'\n';
@@ -212,8 +229,9 @@ function parseNote(t){
     try{v=JSON.parse(l.slice(i+2))}catch(e){return}
     if(k==='id')n.id=v;else if(k==='title')n.title=v;else if(k==='tags')n.tags=v;else if(k==='source')n.source=v;
     else if(k==='created')n.created=v;else if(k==='reviewed')n.lastReviewed=v;else if(k==='links')n.links=v;
-    else if(k==='type')n.type=v==='source'?'source':'idea';else if(k==='reasons')n.reasons=v||{};
+    else if(k==='type')n.type=normType(v);else if(k==='status')n.status=v==='answered'?'answered':'open';else if(k==='reasons')n.reasons=v||{};
   });
+  if(n.type==='question'&&!n.status)n.status='open';
   n.idea=m[2].replace(/\n$/,'');
   return n.id?n:null;
 }
@@ -354,7 +372,11 @@ function vCapture(){
   '<p class="mute" style="margin-top:14px">'+db.notes.length+' notes kept. '+db.inbox.length+' dumps waiting.'+(db.settings.key?'':' AI sorting is off. Add your key under More to turn it on.')+'</p>';
 }
 function typeSelect(cls,type,extra){
-  return '<select class="'+cls+'" '+(extra||'')+' aria-label="Note type"><option value="idea"'+(type==='source'?'':' selected')+'>My idea (what I think)</option><option value="source"'+(type==='source'?' selected':'')+'>Source note (what the source said)</option></select>';
+  type=normType(type);
+  function o(v,l){return '<option value="'+v+'"'+(type===v?' selected':'')+'>'+l+'</option>'}
+  return '<select class="'+cls+'" '+(extra||'')+' aria-label="Note type">'+
+    o('idea','My idea (what I think)')+o('source','Source note (what the source said)')+
+    o('question','Question (something I am still asking)')+o('hub','Hub (a theme or claim that gathers notes)')+'</select>';
 }
 function vInbox(){
   if(!db.inbox.length)return '<h1>Inbox</h1><p class="hint">Nothing waiting. Go dump something.</p>';
@@ -405,6 +427,19 @@ function vDaily(){
    :'<div class="card"><p class="mute">Already linked to everything. Nice.</p><button data-a="dskip" data-n="'+n.id+'">Next</button></div>');
 }
 function chips(tags){return tags.map(function(t){return '<span class="tag" data-a="tag" data-t="'+esc(t)+'">#'+esc(t)+'</span>'}).join('')}
+// Notes the current answer cites, in order of first citation.
+function citedIds(){
+  var a=state.ask,seen={},out=[];
+  (a.text||'').replace(/\[(\d+)\]/g,function(m,k){var id=a.used[+k-1];if(id&&noteById(id)&&!seen[id]){seen[id]=1;out.push(id)}return m});
+  return out;
+}
+// Most common topic tag among the given notes, or '' if none.
+function topicFor(ids){
+  var c={},best='',m=0;
+  ids.forEach(function(id){var n=noteById(id);if(!n)return;var t=n.tags.find(function(x){return TOPICS.indexOf(x)>-1});if(t)c[t]=(c[t]||0)+1});
+  Object.keys(c).forEach(function(t){if(c[t]>m){m=c[t];best=t}});
+  return best;
+}
 function answerHtml(){
   var a=state.ask;
   if(a.error)return '<p style="color:var(--warn)">'+esc(a.error)+'</p>';
@@ -418,17 +453,28 @@ function answerHtml(){
   return '<div class="card hl"><div class="answer">'+html+'</div></div>'+
     (order.length?'<div class="label">Notes used</div>'+order.map(function(id){return '<div class="card"><b data-a="open" data-id="'+id+'" style="cursor:pointer">'+esc(noteById(id).title)+'</b></div>'}).join(''):'');
 }
+// Buttons under an answer: keep the question, keep the answer.
+function askActions(){
+  var a=state.ask;
+  if(!a.q||a.loading)return '';
+  var out='<div class="label">Keep this</div><div class="row" style="margin-bottom:12px">';
+  if(a.qid&&noteById(a.qid))out+='<button data-a="open" data-id="'+a.qid+'">Open question note</button>';
+  else out+='<button data-a="askq">Keep as open question</button>';
+  if(a.saved&&noteById(a.saved))out+='<button data-a="open" data-id="'+a.saved+'">Open saved answer</button>';
+  else if(a.text&&!a.error&&citedIds().length)out+='<button class="primary" data-a="saveans">Save answer as note</button>';
+  return out+'</div>';
+}
 function vNotes(){
   if(state.openId&&noteById(state.openId))return vDetail(noteById(state.openId));
   var tog='<div class="row" style="margin-bottom:10px"><button class="'+(state.mode==='search'?'primary':'')+'" data-a="mode" data-m="search">Search</button><button class="'+(state.mode==='ask'?'primary':'')+'" data-a="mode" data-m="ask">Ask</button></div>';
   if(state.mode==='ask')return '<h1>Notes</h1>'+tog+
-    '<p class="hint">Ask a question. Claude answers using only your notes and shows which ones it used.</p>'+
+    '<p class="hint">Ask a question. Claude answers using only your notes and shows which ones it used. If your notes fall short, keep it as an open question.</p>'+
     '<textarea id="ask" style="min-height:90px" placeholder="What have I written about...?">'+esc(state.ask.q)+'</textarea>'+
-    '<button class="primary" style="width:100%;margin-bottom:12px" data-a="ask">'+(state.ask.loading?'Thinking...':'Ask')+'</button>'+answerHtml();
+    '<button class="primary" style="width:100%;margin-bottom:12px" data-a="ask">'+(state.ask.loading?'Thinking...':'Ask')+'</button>'+answerHtml()+askActions();
   var q=state.q.toLowerCase().trim();
-  var list=db.notes.filter(function(n){return !q||(n.title+' '+n.idea+' '+n.tags.map(function(t){return '#'+t}).join(' ')+' '+n.tags.join(' ')).toLowerCase().indexOf(q)>-1}).sort(function(a,b){return b.created-a.created});
+  var list=db.notes.filter(function(n){return !q||(n.title+' '+n.idea+' '+n.tags.map(function(t){return '#'+t}).join(' ')+' '+n.tags.join(' ')+' '+typeLabel(n)).toLowerCase().indexOf(q)>-1}).sort(function(a,b){return b.created-a.created});
   return '<h1>Notes</h1>'+tog+'<input id="q" type="search" placeholder="Search notes or #tags" value="'+esc(state.q)+'">'+
-  (list.length?list.map(function(n){return '<div class="card"><h2 data-a="open" data-id="'+n.id+'" style="cursor:pointer">'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div><div style="margin-top:8px">'+(n.type==='source'?'<span class="tag" style="cursor:default">source note</span>':'')+chips(n.tags)+'<span class="mute">'+(n.links.length?n.links.length+' link'+(n.links.length>1?'s':''):'no links yet')+'</span></div></div>'}).join(''):'<p class="hint">'+(db.notes.length?'No matches.':'No notes yet.')+'</p>');
+  (list.length?list.map(function(n){return '<div class="card"><h2 data-a="open" data-id="'+n.id+'" style="cursor:pointer">'+esc(n.title)+'</h2><div>'+esc(n.idea)+'</div><div style="margin-top:8px">'+(typeLabel(n)?'<span class="tag" style="cursor:default">'+typeLabel(n)+'</span>':'')+chips(n.tags)+'<span class="mute">'+(n.links.length?n.links.length+' link'+(n.links.length>1?'s':''):'no links yet')+'</span></div></div>'}).join(''):'<p class="hint">'+(db.notes.length?'No matches.':'No notes yet.')+'</p>');
 }
 function vDetail(n){
   var linked=n.links.map(noteById).filter(Boolean),all=suggest(n,1000),sug=all.slice(0,state.sugN),hasKey=!!db.settings.key;
@@ -437,10 +483,11 @@ function vDetail(n){
   return '<button class="small" data-a="back">Back</button><h1 style="margin-top:10px">Edit note</h1>'+
   '<input data-f="title" data-id="'+n.id+'" value="'+esc(n.title)+'">'+
   '<textarea data-f="idea" data-id="'+n.id+'" style="min-height:110px">'+esc(n.idea)+'</textarea>'+
-  '<input data-f="tags" data-id="'+n.id+'" value="'+esc(n.tags.join(', '))+'" placeholder="tags, comma separated">'+
+  '<input data-f="tags" data-id="'+n.id+'" value="'+esc(n.tags.join(', '))+'" placeholder="tags, comma separated (first one is the topic)">'+
   typeSelect('',n.type,'data-f="type" data-id="'+n.id+'"')+
+  (n.type==='question'?'<select data-f="status" data-id="'+n.id+'" aria-label="Question status"><option value="open"'+(n.status==='answered'?'':' selected')+'>Open question</option><option value="answered"'+(n.status==='answered'?' selected':'')+'>Answered</option></select>':'')+
   (n.source?'<p class="mute">Source: '+esc(n.source)+'</p>':'')+
-  '<div class="label">Linked notes ('+linked.length+')</div>'+(linked.length?linked.map(function(o){return '<div class="card"><b data-a="open" data-id="'+o.id+'" style="cursor:pointer">'+esc(o.title)+'</b> <button class="small danger" data-a="unlink" data-n="'+n.id+'" data-o="'+o.id+'">Unlink</button>'+
+  '<div class="label">Linked notes ('+linked.length+')</div>'+(linked.length?linked.map(function(o){return '<div class="card"><b data-a="open" data-id="'+o.id+'" style="cursor:pointer">'+esc(o.title)+'</b>'+(typeLabel(o)?' <span class="tag" style="cursor:default">'+typeLabel(o)+'</span>':'')+' <button class="small danger" data-a="unlink" data-n="'+n.id+'" data-o="'+o.id+'">Unlink</button>'+
     '<input data-r="1" data-n="'+n.id+'" data-o="'+o.id+'" value="'+esc(reasonOf(n,o))+'" placeholder="Why do these connect? (optional)" style="margin:8px 0 6px">'+
     (hasKey?'<button class="small" data-a="rsuggest2" data-n="'+n.id+'" data-o="'+o.id+'">Suggest reason</button>':'')+'</div>'}).join(''):'<p class="mute">None yet.</p>')+
   '<div class="label">Link any note</div><input id="lq" type="search" placeholder="Search your notes to link" value="'+esc(state.lq)+'">'+
@@ -466,7 +513,8 @@ function vMore(){
   '<p class="hint">An estimate counted on this device only (Haiku rates, or Sonnet-class rates for other models). The Anthropic console shows your exact bill, and you can set a monthly spend limit there.</p></div>'+
   '<div class="card"><h2>Export and restore</h2><p class="hint">Your notes are also plain Markdown files in the notes repo. These are extra copies.</p>'+
   '<div class="row"><button data-a="exportmd">Export Markdown</button><button data-a="exportjson">Backup JSON</button></div>'+
-  '<div class="label">Restore from backup</div><input type="file" id="imp" accept="application/json"></div>';
+  '<div class="label">Restore from backup</div><input type="file" id="imp" accept="application/json"></div>'+
+  '<p class="mute" style="text-align:center">Slipbox v1.1</p>';
 }
 
 function render(){
@@ -486,6 +534,8 @@ function advance(id){
   if(d.done.indexOf(id)<0)d.done.push(id);
   state.reason=null;save();render();
 }
+// Open a note's detail view (used after Ask creates a note that still needs a topic tag).
+function openNote(id){state.tab='notes';state.mode='search';state.openId=id;state.lq='';state.sugN=3;render();window.scrollTo(0,0)}
 
 var A={
   tab:function(b){state.tab=b.dataset.t;state.openId=null;render();window.scrollTo(0,0)},
@@ -498,7 +548,10 @@ var A={
     var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
     var box=document.querySelector('[data-draft="'+b.dataset.draft+'"]');
     var title=box.querySelector('.t').value.trim()||'Untitled';
-    db.notes.push({id:uid(),title:title,idea:box.querySelector('.i').value.trim(),tags:parseTags(box.querySelector('.g').value),type:box.querySelector('.ty').value==='source'?'source':'idea',source:it.source,created:Date.now(),links:[],reasons:{},lastReviewed:0});
+    var ty=normType(box.querySelector('.ty').value);
+    var note={id:uid(),title:title,idea:box.querySelector('.i').value.trim(),tags:parseTags(box.querySelector('.g').value),type:ty,source:it.source,created:Date.now(),links:[],reasons:{},lastReviewed:0};
+    if(ty==='question')note.status='open';
+    db.notes.push(note);
     it.drafts=it.drafts.filter(function(d){return d.id!==b.dataset.draft});
     if(!it.drafts.length)db.inbox=db.inbox.filter(function(x){return x.id!==it.id});
     save();toast('Kept');render();
@@ -536,11 +589,33 @@ var A={
   mode:function(b){state.mode=b.dataset.m;render()},
   ask:async function(){
     var q=$('#ask').value.trim();if(!q){toast('Type a question first');return}
-    state.ask.q=q;state.ask.text='';state.ask.used=[];state.ask.error='';
+    state.ask.q=q;state.ask.text='';state.ask.used=[];state.ask.error='';state.ask.qid=null;state.ask.saved=null;
     if(!db.settings.key){state.ask.error='Add your Anthropic API key under More to use Ask.';render();return}
     state.ask.loading=true;render();
     try{var r=await askNotes(q);state.ask.text=r.text;state.ask.used=r.used}catch(e){state.ask.error=e.message}
     state.ask.loading=false;render();
+  },
+  // Save the question just asked as a question note, linked to any notes the answer cited.
+  askq:function(){
+    var a=state.ask;if(!a.q)return;
+    var ids=citedIds(),topic=topicFor(ids);
+    var n={id:uid(),title:a.q.length>70?a.q.slice(0,67).trim()+'...':a.q,idea:a.q,tags:topic?[topic]:[],type:'question',status:'open',source:'',created:Date.now(),links:[],reasons:{},lastReviewed:0};
+    db.notes.push(n);
+    ids.forEach(function(id){var o=noteById(id);if(o)link(n,o)});
+    a.qid=n.id;save();
+    if(topic){toast('Kept as open question');render()}else{toast('Kept. Add a topic tag.');openNote(n.id)}
+  },
+  // Save the answer as an idea note, marked as synthesized, linked to what it cited and to the question note.
+  saveans:function(){
+    var a=state.ask,ids=citedIds();if(!a.text||!ids.length)return;
+    var topic=topicFor(ids),body=a.text.replace(/\s*\[\d+\]/g,'').trim();
+    var t=a.q.length>58?a.q.slice(0,55).trim()+'...':a.q;
+    var n={id:uid(),title:'Answer: '+t,idea:body,tags:topic?[topic]:[],type:'idea',source:'Slipbox Ask (synthesized from my notes)',created:Date.now(),links:[],reasons:{},lastReviewed:0};
+    db.notes.push(n);
+    ids.forEach(function(id){var o=noteById(id);if(o)link(n,o)});
+    var qn=a.qid&&noteById(a.qid);if(qn)link(n,qn);
+    a.saved=n.id;save();
+    if(topic){toast('Saved as a note');render()}else{toast('Saved. Add a topic tag.');openNote(n.id)}
   },
   delnote:function(b){
     if(!confirm('Delete this note?'))return;var n=noteById(b.dataset.id);
@@ -560,7 +635,8 @@ var A={
   syncnow:function(){if(!gh()){state.tab='more';render();return}flush()},
   exportmd:function(){
     var md=db.notes.slice().sort(function(a,b){return a.created-b.created}).map(function(n){
-      return '# '+n.title+'\n\n'+n.idea+'\n\n'+(n.type==='source'?'Type: source note\n':'')+(n.tags.length?'Tags: '+n.tags.map(function(t){return '#'+t}).join(' ')+'\n':'')+(n.source?'Source: '+n.source+'\n':'')+
+      var ty=normType(n.type);
+      return '# '+n.title+'\n\n'+n.idea+'\n\n'+(ty!=='idea'?'Type: '+(ty==='source'?'source note':ty)+(ty==='question'?' ('+(n.status==='answered'?'answered':'open')+')':'')+'\n':'')+(n.tags.length?'Tags: '+n.tags.map(function(t){return '#'+t}).join(' ')+'\n':'')+(n.source?'Source: '+n.source+'\n':'')+
       (n.links.length?'Links: '+n.links.map(noteById).filter(Boolean).map(function(o){var r=reasonOf(n,o);return '[['+o.title+']]'+(r?' ('+r+')':'')}).join(', ')+'\n':'')}).join('\n---\n\n');
     download('slipbox-'+today()+'.md',md,'text/markdown');
   },
@@ -575,7 +651,14 @@ document.addEventListener('input',function(e){
 document.addEventListener('change',function(e){
   var t=e.target;
   if(t.dataset&&t.dataset.r){var a=noteById(t.dataset.n),o=noteById(t.dataset.o);if(a&&o){setReason(a,o,t.value);save();toast('Saved')}return}
-  if(t.dataset&&t.dataset.f){var n=noteById(t.dataset.id);if(!n)return;n[t.dataset.f]=t.dataset.f==='tags'?parseTags(t.value):t.value;save();toast('Saved')}
+  if(t.dataset&&t.dataset.f){var n=noteById(t.dataset.id);if(!n)return;
+    if(t.dataset.f==='tags')n.tags=parseTags(t.value);
+    else if(t.dataset.f==='type'){n.type=normType(t.value);if(n.type==='question'&&!n.status)n.status='open'}
+    else if(t.dataset.f==='status')n.status=t.value==='answered'?'answered':'open';
+    else n[t.dataset.f]=t.value;
+    save();toast('Saved');
+    if(t.dataset.f==='type')render();
+  }
   if(t.id==='imp'&&t.files[0]){var r=new FileReader();r.onload=function(){try{
     var d=JSON.parse(r.result);if(!Array.isArray(d.notes))throw 0;if(!confirm('Replace current notes with this backup?'))return;
     var keep={key:db.settings.key,model:db.settings.model,gh:db.settings.gh,usage:db.settings.usage},oldShas=db.sync.shas;
