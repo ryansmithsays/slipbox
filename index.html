@@ -304,7 +304,11 @@ function pickDaily(){
 function vDaily(){
   if(db.notes.length<2)return '<h1>Daily 5</h1><p class="hint">Keep at least two notes and I will start suggesting connections here.</p>';
   var d=pickDaily(),left=d.ids.filter(function(id){return d.done.indexOf(id)<0&&noteById(id)});
-  if(!left.length)return '<h1>Daily 5</h1><div class="card hl"><h2>Done for today</h2><p class="mute">'+d.done.length+' reviewed. Come back tomorrow.</p></div>';
+  if(!left.length){
+    var more=db.notes.some(function(n){return d.ids.indexOf(n.id)<0});
+    return '<h1>Daily 5</h1><div class="card hl"><h2>Round complete</h2><p class="mute">'+d.done.length+' reviewed today.'+(more?' In the zone? Keep going.':' You have been through every note.')+'</p>'+
+      (more?'<button class="primary" style="width:100%" data-a="moreDaily">Keep going: 5 more</button>':'')+'</div>';
+  }
   var n=noteById(left[0]),s=suggest(n,1)[0],other,why;
   if(s){other=s.note;why='Shared: '+s.why.map(esc).join(', ')}
   else{var pool=db.notes.filter(function(o){return o.id!==n.id&&n.links.indexOf(o.id)<0});
@@ -387,6 +391,12 @@ var A={
   },
   dlink:function(b){var n=noteById(b.dataset.n),o=noteById(b.dataset.o);link(n,o);A.dskip(b)},
   dskip:function(b){var n=noteById(b.dataset.n),d=pickDaily();if(n)n.lastReviewed=Date.now();if(d.done.indexOf(b.dataset.n)<0)d.done.push(b.dataset.n);save();render()},
+  moreDaily:function(){
+    var d=pickDaily();
+    var ids=db.notes.filter(function(n){return d.ids.indexOf(n.id)<0}).sort(function(a,b){return (a.lastReviewed||0)-(b.lastReviewed||0)}).slice(0,5).map(function(n){return n.id});
+    if(!ids.length){toast('You have been through every note');return}
+    d.ids=d.ids.concat(ids);saveLocal();render();window.scrollTo(0,0);
+  },
   dlink2:function(b){link(noteById(b.dataset.n),noteById(b.dataset.o));save();toast('Linked');render()},
   unlink:function(b){unlink(noteById(b.dataset.n),noteById(b.dataset.o));save();render()},
   open:function(b){state.tab='notes';state.openId=b.dataset.id;render();window.scrollTo(0,0)},
