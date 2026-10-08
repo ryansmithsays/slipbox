@@ -167,13 +167,41 @@ async function aiSort(raw,source){
   if(cut)toast('Long dump: AI sorted the first part only. The full text is in the original.');
   return drafts.slice(0,12);
 }
+// ---------- offline queue ----------
+// A dump that needs the AI but cannot reach it is kept as status 'queued' with its raw text.
+// When the connection returns, drainQueue() sorts each one, then the GitHub sync uploads the result.
+function isNetErr(e){return !navigator.onLine||/Failed to fetch|Load failed|NetworkError|network connection|timed out/i.test((e&&e.message)||'')}
+function queuedItems(){return db.inbox.filter(function(it){return it.status==='queued'})}
+function queueItem(item){
+  item.status='queued';item.drafts=null;item.queuedAt=item.queuedAt||Date.now();
+  save();setStatus(SY.status);refresh();
+  toast('Saved on this device. It will be sorted when you are back online.');
+}
+// Returns true when the item finished (drafts ready), false when it was queued to wait for a connection.
 async function processItem(item){
+  if(!db.settings.key){item.drafts=heuristic(item.raw);item.status='done';save();refresh();return true}
+  if(!navigator.onLine){queueItem(item);return false}
   try{
-    item.drafts=db.settings.key?await aiSort(item.raw,item.source):heuristic(item.raw);
+    item.drafts=await aiSort(item.raw,item.source);
   }catch(e){
+    if(isNetErr(e)){queueItem(item);return false}
     item.drafts=heuristic(item.raw);toast('AI sort failed, used a basic draft');
   }
-  item.status='done';save();refresh();
+  item.status='done';save();refresh();return true;
+}
+var DR={busy:false};
+async function drainQueue(){
+  if(DR.busy||!navigator.onLine)return;
+  var q=queuedItems();if(!q.length)return;
+  DR.busy=true;var done=0;
+  try{
+    for(const it of q){
+      if(!navigator.onLine||!db.inbox.some(function(x){return x.id===it.id&&x.status==='queued'}))continue;
+      if(await processItem(it))done++;else break;
+    }
+  }finally{DR.busy=false}
+  if(done)toast('Back online. Sorted '+done+' queued dump'+(done>1?'s':'')+'.');
+  setStatus(SY.status);refresh();
 }
 async function aiReason(a,b){
   return callClaude({system:'In one short sentence (under 20 words), explain how these two notes connect. Reply with only the sentence, no quotation marks.',
@@ -337,6 +365,13 @@ async function push(){
 }
 function setStatus(k,msg){
   SY.status=k;var el=$('#status');if(!el)return;
+  // Offline: show what is waiting, since everything is already safe on this device.
+  var n=queuedItems().length+(gh()?Object.keys(db.sync.dirty||{}).length:0);
+  if(!navigator.onLine&&(n>0||gh())){
+    el.className=n>0?'warn':'';
+    el.textContent='● Offline. '+(n>0?n+' waiting to upload. Everything is saved on this device.':'Notes save on this device and upload when you reconnect.');
+    return;
+  }
   var time=SY.last?new Date(SY.last).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'';
   var t={off:'Only on this device. Tap here to set up GitHub sync.',pending:'Changes waiting to sync...',syncing:'Syncing...',synced:'Saved to GitHub'+(time?' at '+time:''),error:'Not synced: '+(msg||'unknown error')+'. Tap to retry.'}[k];
   el.className=(k==='off'||k==='error')?'warn':'';
@@ -344,11 +379,13 @@ function setStatus(k,msg){
 }
 function schedule(ms){
   if(!gh()){setStatus('off');return}
+  if(!navigator.onLine){setStatus('pending');return}
   clearTimeout(SY.timer);SY.timer=setTimeout(flush,ms||2500);
   if(SY.status!=='syncing')setStatus('pending');
 }
 async function flush(){
   if(!gh()){setStatus('off');return}
+  if(!navigator.onLine){setStatus('pending');return}
   if(SY.busy){SY.again=true;return}
   SY.busy=true;clearTimeout(SY.timer);setStatus('syncing');
   try{
@@ -356,7 +393,7 @@ async function flush(){
     SY.last=Date.now();db.settings.lastSync=SY.last;saveLocal();
     setStatus('synced');
   }catch(e){
-    setStatus('error',e.message==='Failed to fetch'?'no connection':e.message);
+    setStatus('error',isNetErr(e)?'no connection':e.message);
   }
   SY.busy=false;
   if(SY.changed){SY.changed=false;refresh()}
@@ -369,7 +406,7 @@ function vCapture(){
   '<textarea id="raw" placeholder="What did you just read or hear?"></textarea>'+
   '<input id="src" placeholder="Source (book, podcast, link). Optional">'+
   '<button class="primary" style="width:100%" data-a="capture">Add to inbox</button>'+
-  '<p class="mute" style="margin-top:14px">'+db.notes.length+' notes kept. '+db.inbox.length+' dumps waiting.'+(db.settings.key?'':' AI sorting is off. Add your key under More to turn it on.')+'</p>';
+  '<p class="mute" style="margin-top:14px">'+db.notes.length+' notes kept. '+db.inbox.length+' dumps waiting.'+(db.settings.key?'':' AI sorting is off. Add your key under More to turn it on.')+(navigator.onLine?'':' You are offline. Dumps are saved here and sorted when you reconnect.')+'</p>';
 }
 function typeSelect(cls,type,extra){
   type=normType(type);
@@ -381,6 +418,10 @@ function typeSelect(cls,type,extra){
 function vInbox(){
   if(!db.inbox.length)return '<h1>Inbox</h1><p class="hint">Nothing waiting. Go dump something.</p>';
   return '<h1>Inbox</h1><p class="hint">Edit if you like, check the type, then Keep or Toss.</p>'+db.inbox.slice().sort(function(a,b){return b.created-a.created}).map(function(it){
+    if(it.status==='queued')return '<div class="card" data-item="'+it.id+'"><div class="label">Saved offline'+(it.queuedAt?' at '+new Date(it.queuedAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'}):'')+'</div>'+
+      '<div class="raw">'+esc(it.raw)+'</div>'+(it.source?'<p class="mute">Source: '+esc(it.source)+'</p>':'')+
+      '<p class="mute">Waiting for a connection. It will be sorted automatically.</p>'+
+      '<div class="row"><button data-a="sortnow" data-item="'+it.id+'">Try now</button><button data-a="basic" data-item="'+it.id+'">Use basic draft</button><button class="danger" data-a="dropq" data-item="'+it.id+'">Delete</button></div></div>';
     if(it.status!=='done'||!it.drafts)return '<div class="card"><p class="mute">Sorting...</p></div>';
     return '<div class="card" data-item="'+it.id+'"><details><summary>Original dump'+(it.source?' ('+esc(it.source)+')':'')+'</summary><div class="raw">'+esc(it.raw)+'</div></details>'+
     it.drafts.map(function(d){return '<div data-draft="'+d.id+'" style="border-top:1px solid var(--line);padding-top:10px;margin-top:10px">'+
@@ -514,7 +555,7 @@ function vMore(){
   '<div class="card"><h2>Export and restore</h2><p class="hint">Your notes are also plain Markdown files in the notes repo. These are extra copies.</p>'+
   '<div class="row"><button data-a="exportmd">Export Markdown</button><button data-a="exportjson">Backup JSON</button></div>'+
   '<div class="label">Restore from backup</div><input type="file" id="imp" accept="application/json"></div>'+
-  '<p class="mute" style="text-align:center">Slipbox v1.1</p>';
+  '<p class="mute" style="text-align:center">Slipbox v1.2</p>';
 }
 
 function render(){
@@ -542,7 +583,20 @@ var A={
   capture:function(){
     var raw=$('#raw').value.trim();if(!raw){toast('Nothing to add yet');return}
     var item={id:uid(),raw:raw,source:$('#src').value.trim(),created:Date.now(),drafts:null,status:'processing'};
-    db.inbox.unshift(item);save();$('#raw').value='';$('#src').value='';toast('Added. Sorting...');render();processItem(item);
+    db.inbox.unshift(item);save();$('#raw').value='';$('#src').value='';if(navigator.onLine)toast('Added. Sorting...');render();processItem(item);
+  },
+  sortnow:function(b){
+    var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
+    if(!navigator.onLine){toast('Still offline. It will sort when you reconnect.');return}
+    drainQueue();
+  },
+  basic:function(b){
+    var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
+    it.drafts=heuristic(it.raw);it.status='done';save();setStatus(SY.status);render();
+  },
+  dropq:function(b){
+    if(!confirm('Delete this saved dump?'))return;
+    db.inbox=db.inbox.filter(function(x){return x.id!==b.dataset.item});save();setStatus(SY.status);render();
   },
   keep:function(b){
     var it=db.inbox.find(function(x){return x.id===b.dataset.item});if(!it)return;
@@ -670,15 +724,28 @@ document.addEventListener('change',function(e){
 });
 
 // keep notes safe: sync when leaving, coming back, or going online
-document.addEventListener('visibilitychange',function(){if(!gh())return;if(document.hidden){if(hasDirty())flush()}else schedule(300)});
-window.addEventListener('online',function(){if(gh())flush()});
-window.addEventListener('beforeunload',function(e){if(gh()&&hasDirty()){e.preventDefault();e.returnValue=''}});
-setInterval(function(){if(gh()&&!document.hidden)flush()},60000);
+document.addEventListener('visibilitychange',function(){
+  if(!document.hidden&&queuedItems().length)reconnect();
+  if(!gh())return;
+  if(document.hidden){if(hasDirty())flush()}else schedule(300);
+});
+// Back online: sort anything queued first, then upload everything to GitHub.
+function reconnect(){drainQueue().then(function(){if(gh())flush()}).catch(function(){})}
+window.addEventListener('online',function(){setStatus(SY.status);reconnect()});
+window.addEventListener('offline',function(){setStatus(SY.status);refresh()});
+window.addEventListener('beforeunload',function(e){if(gh()&&hasDirty()&&navigator.onLine){e.preventDefault();e.returnValue=''}});
+// Retry every minute too: airplane or hotel wifi can report online while the internet is still unreachable.
+setInterval(function(){if(document.hidden)return;if(queuedItems().length)reconnect();else if(gh())flush()},60000);
+// Let the app open with no connection.
+if('serviceWorker' in navigator&&(location.protocol==='https:'||location.hostname==='localhost')){
+  window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){})});
+}
 
 // start up
-db.inbox.forEach(function(it){if(it.status!=='done'||!it.drafts){it.status='processing';processItem(it)}});
+db.inbox.forEach(function(it){if(it.status!=='queued'&&(it.status!=='done'||!it.drafts)){it.status='processing';processItem(it)}});
 scan();render();
 if(gh())flush();else setStatus('off');
+reconnect();
 })();
 </script>
 </body>
