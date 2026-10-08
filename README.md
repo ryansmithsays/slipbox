@@ -30,10 +30,21 @@ After an answer you can tap:
 
 Question notes are left out of Ask's evidence, since a question is not an answer.
 
+## Offline (v1.2)
+
+Slipbox works with no connection, for example on a plane.
+
+- **Dumping offline:** the dump is saved on your device and shows in the Inbox as "Saved offline". The status line at the top shows how many items are waiting.
+- **Back online:** queued dumps are sorted automatically, then everything is uploaded to your notes repo, and the waiting list clears itself. The Inbox card also has Try now, Use basic draft (skip the AI), and Delete.
+- **Editing offline:** edits, links, and Keep or Toss all save on your device and upload when you reconnect.
+- **Opening offline:** the app caches itself the first time you open it online. Open it once with a connection after installing or updating. A new version of the page appears the next time you open the app.
+
+Airplane wifi that is connected but not yet on the internet is handled too: Slipbox retries every minute.
+
 ## Data and privacy
 
 Notes are stored in your browser (localStorage). Nothing is sent anywhere except, if you add an Anthropic API key under More, the text of a dump is sent to api.anthropic.com for sorting, and the notes Ask selects are sent along with your question. Use **More > Backup JSON** regularly. **Export Markdown** gives you a plain-text copy with `[[wiki links]]`.
 
 ## Hosting
 
-It is a single `index.html`. Enable GitHub Pages (Settings > Pages > Deploy from branch > `main` / root) and open the URL on your phone. On iPhone, use Share > Add to Home Screen.
+It is `index.html` plus a small `sw.js` (the service worker that lets the app open offline). Keep both in the same folder. Enable GitHub Pages (Settings > Pages > Deploy from branch > `main` / root) and open the URL on your phone. On iPhone, use Share > Add to Home Screen.
